@@ -1,0 +1,13 @@
+services:
+  bot:
+    build: .
+    container_name: window-washer-rental-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-Europe/Amsterdam}
+    volumes:
+      - ./data:/app/data
+      - ./generated:/app/generated
+      - ./docs:/app/docs:ro
