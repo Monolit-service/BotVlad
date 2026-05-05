@@ -91,9 +91,7 @@ async def init_db(initial_robots: int = 1) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(SCHEMA_SQL)
-        # Миграция со старых версий: раньше уменьшение парка переводило робота
-        # в статус inactive. Теперь отдельного inactive нет: робот либо активен,
-        # либо находится на обслуживании, либо удаляется из базы.
+        # Старые версии использовали статус inactive. Теперь это обслуживание.
         await db.execute("UPDATE robots SET status='maintenance' WHERE status='inactive'")
         await db.commit()
         cursor = await db.execute("SELECT COUNT(*) FROM robots")
@@ -146,28 +144,21 @@ async def active_robot_count() -> int:
 
 async def robot_summary() -> dict[str, int]:
     async with get_db() as db:
-        # На всякий случай нормализуем старые записи из предыдущих версий.
-        await db.execute("UPDATE robots SET status='maintenance' WHERE status='inactive'")
         cursor = await db.execute("SELECT status, COUNT(*) AS cnt FROM robots GROUP BY status")
         rows = await cursor.fetchall()
-
-    summary = {"active": 0, "maintenance": 0, "total": 0}
+    summary = {"active": 0, "maintenance": 0, "inactive": 0, "total": 0}
     for row in rows:
         status = row["status"]
         count = int(row["cnt"])
-        if status == "active":
-            summary["active"] += count
-        elif status == "maintenance":
-            summary["maintenance"] += count
-        else:
-            # Неизвестные старые статусы не участвуют в доступности, но видны в общем числе.
-            summary["maintenance"] += count
+        if status == "inactive":
+            status = "maintenance"
+        summary[status] = summary.get(status, 0) + count
         summary["total"] += count
     return summary
 
 
-async def add_robot_to_fleet() -> int:
-    """Create one new robot in the database and make it available for bookings."""
+async def add_robot() -> int:
+    """Add one new robot to the total fleet and make it available."""
     async with get_db() as db:
         cursor = await db.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM robots")
         next_num = int((await cursor.fetchone())[0])
@@ -178,17 +169,18 @@ async def add_robot_to_fleet() -> int:
         return int(cursor.lastrowid)
 
 
-async def remove_one_robot_from_fleet() -> bool:
-    """Delete one robot from the database.
+async def remove_one_robot() -> bool:
+    """Remove one robot from the total fleet.
 
-    Maintenance robots are removed first so availability is not reduced when possible.
-    If there are no maintenance robots, the last active robot is deleted.
+    Prefer deleting a robot that is on maintenance so active availability is not
+    reduced unexpectedly. If there are no maintenance robots, remove the last
+    active robot.
     """
     async with get_db() as db:
         cursor = await db.execute(
             """
             SELECT id FROM robots
-            ORDER BY CASE WHEN status='maintenance' THEN 0 ELSE 1 END, id DESC
+            ORDER BY CASE WHEN status='maintenance' THEN 0 WHEN status='inactive' THEN 1 ELSE 2 END, id DESC
             LIMIT 1
             """
         )
@@ -200,36 +192,33 @@ async def remove_one_robot_from_fleet() -> bool:
 
 
 async def set_total_robot_count(target_count: int) -> dict[str, int]:
-    """Set the exact total number of robots in the database.
+    """Set exact total number of robots stored in the database.
 
-    Increasing the count creates new active robots. Decreasing the count deletes
-    maintenance robots first, then active robots. Existing booking records stay
-    intact; date availability is recalculated from the remaining active robots.
+    Increasing the value creates new active robots. Decreasing the value deletes
+    robots, preferring maintenance robots first, then active robots.
     """
     target_count = max(0, int(target_count))
     async with get_db() as db:
-        await db.execute("UPDATE robots SET status='maintenance' WHERE status='inactive'")
         cursor = await db.execute("SELECT COUNT(*) FROM robots")
-        current_total = int((await cursor.fetchone())[0])
+        total_count = int((await cursor.fetchone())[0])
 
-        if target_count > current_total:
-            for _ in range(target_count - current_total):
+        if target_count > total_count:
+            for _ in range(target_count - total_count):
                 cursor = await db.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM robots")
                 next_num = int((await cursor.fetchone())[0])
                 await db.execute(
                     "INSERT INTO robots(name, status) VALUES (?, 'active')",
                     (f"Робот #{next_num}",),
                 )
-
-        elif target_count < current_total:
-            remove_count = current_total - target_count
+        elif target_count < total_count:
+            delete_count = total_count - target_count
             cursor = await db.execute(
                 """
                 SELECT id FROM robots
-                ORDER BY CASE WHEN status='maintenance' THEN 0 ELSE 1 END, id DESC
+                ORDER BY CASE WHEN status='maintenance' THEN 0 WHEN status='inactive' THEN 1 ELSE 2 END, id DESC
                 LIMIT ?
                 """,
-                (remove_count,),
+                (delete_count,),
             )
             rows = await cursor.fetchall()
             for row in rows:
@@ -238,12 +227,9 @@ async def set_total_robot_count(target_count: int) -> dict[str, int]:
     return await robot_summary()
 
 
-async def move_one_robot_to_maintenance() -> bool:
-    """Mark one active robot as being on maintenance."""
+async def send_one_robot_to_maintenance() -> bool:
     async with get_db() as db:
-        cursor = await db.execute(
-            "SELECT id FROM robots WHERE status='active' ORDER BY id DESC LIMIT 1"
-        )
+        cursor = await db.execute("SELECT id FROM robots WHERE status='active' ORDER BY id DESC LIMIT 1")
         row = await cursor.fetchone()
         if not row:
             return False
@@ -252,11 +238,8 @@ async def move_one_robot_to_maintenance() -> bool:
 
 
 async def return_one_robot_from_maintenance() -> bool:
-    """Return one maintenance robot back to active availability."""
     async with get_db() as db:
-        cursor = await db.execute(
-            "SELECT id FROM robots WHERE status='maintenance' ORDER BY id LIMIT 1"
-        )
+        cursor = await db.execute("SELECT id FROM robots WHERE status IN ('maintenance', 'inactive') ORDER BY id LIMIT 1")
         row = await cursor.fetchone()
         if not row:
             return False
@@ -264,17 +247,13 @@ async def return_one_robot_from_maintenance() -> bool:
         return True
 
 
-# Backward-compatible aliases for older code/tests.
+# Backward-compatible aliases for old handlers or external scripts.
 async def set_active_robot_count(target_count: int) -> dict[str, int]:
     return await set_total_robot_count(target_count)
 
 
-async def add_robot() -> int:
-    return await add_robot_to_fleet()
-
-
 async def remove_one_active_robot() -> bool:
-    return await remove_one_robot_from_fleet()
+    return await remove_one_robot()
 
 
 async def create_booking(

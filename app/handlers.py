@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime
+import logging
 
 from aiogram import Bot, F, Router
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, FSInputFile, Message
 
@@ -27,6 +28,7 @@ from app.states import AdminSupportReply, BookingForm, RobotSettings, SupportCha
 from app.texts import CONTACT_TEXT, PRICES_TEXT, SUPPORT_PROMPT_TEXT, admin_welcome, booking_card, client_welcome
 
 router = Router()
+logger = logging.getLogger(__name__)
 settings: Settings | None = None
 
 
@@ -65,11 +67,11 @@ async def robots_panel_text() -> str:
         f"Всего роботов в базе: {total}\n"
         f"Доступны для бронирования: {active}\n"
         f"На обслуживании: {maintenance}\n\n"
-        "Календарь считает свободные даты только по роботам, которые доступны для бронирования. "
-        "Роботы на обслуживании остаются в общем парке, но временно не участвуют в доступности.\n\n"
-        "Кнопки добавления/удаления меняют именно общее число роботов в базе."
+        "Доступность календаря считается только по роботам, которые доступны для бронирования. "
+        "Роботы на обслуживании остаются в общем парке, но не выдаются клиентам.\n\n"
+        "➕/➖ меняют общее количество роботов. "
+        "🛠️/✅ переводят роботов на обслуживание и обратно."
     )
-
 
 @router.message(Command("start"))
 async def cmd_start(message: Message) -> None:
@@ -104,6 +106,12 @@ async def prices(message: Message) -> None:
 
 
 @router.message(F.text == "📞 Связаться")
+@router.message(F.text == "Связаться")
+@router.message(Command("contact"))
+@router.message(
+    StateFilter(None),
+    lambda message: bool(message.text and ("связ" in message.text.lower() or "контакт" in message.text.lower())),
+)
 async def contacts(message: Message, state: FSMContext) -> None:
     if not message.from_user:
         return
@@ -192,7 +200,7 @@ async def cb_admin_day(callback: CallbackQuery) -> None:
     dt = datetime.strptime(iso_date, "%Y-%m-%d").date()
     text = (
         f"🔧 Управление датой {dt.strftime('%d.%m.%Y')}\n\n"
-        f"Доступных для бронирования: {usage.active_robots}\n"
+        f"Всего активных роботов: {usage.active_robots}\n"
         f"Подтверждённых броней: {usage.confirmed_bookings}\n"
         f"Ручных блокировок: {usage.manual_blocks}\n"
         f"Свободно: {usage.available}\n\n"
@@ -223,7 +231,7 @@ async def cb_admin_block(callback: CallbackQuery) -> None:
     usage = await db.day_usage(iso_date)
     text = (
         f"🔧 Управление датой {dt.strftime('%d.%m.%Y')}\n\n"
-        f"Доступных для бронирования: {usage.active_robots}\n"
+        f"Всего активных роботов: {usage.active_robots}\n"
         f"Подтверждённых броней: {usage.confirmed_bookings}\n"
         f"Ручных блокировок: {usage.manual_blocks}\n"
         f"Свободно: {usage.available}"
@@ -482,25 +490,27 @@ async def cb_robots(callback: CallbackQuery, state: FSMContext) -> None:
     if not callback.data:
         return
     action = callback.data.split(":", 1)[1]
-    if action in {"add_total", "add"}:
-        await db.add_robot_to_fleet()
-        await callback.answer("Добавлен 1 робот в базу")
-    elif action in {"remove_total", "remove"}:
-        ok = await db.remove_one_robot_from_fleet()
-        await callback.answer("Удалён 1 робот из базы" if ok else "В базе нет роботов", show_alert=not ok)
+
+    if action == "add":
+        await db.add_robot()
+        await callback.answer("Добавлен 1 робот в общий парк")
+    elif action == "remove":
+        ok = await db.remove_one_robot()
+        await callback.answer("Удалён 1 робот из общего парка" if ok else "В базе нет роботов", show_alert=not ok)
     elif action == "maintenance_add":
-        ok = await db.move_one_robot_to_maintenance()
-        await callback.answer("1 робот поставлен на обслуживание" if ok else "Нет доступных роботов", show_alert=not ok)
+        ok = await db.send_one_robot_to_maintenance()
+        await callback.answer("1 робот отправлен на обслуживание" if ok else "Нет доступных роботов", show_alert=not ok)
     elif action == "maintenance_remove":
         ok = await db.return_one_robot_from_maintenance()
         await callback.answer("1 робот снят с обслуживания" if ok else "Нет роботов на обслуживании", show_alert=not ok)
-    elif action in {"set_total", "set"}:
+    elif action == "set_total":
         await state.set_state(RobotSettings.count)
         if callback.message:
             await callback.message.answer(
                 "Введите общее количество роботов в базе числом.\n\n"
                 "Например: 3\n"
-                "Если указать меньше текущего, бот удалит лишние записи: сначала роботов на обслуживании, затем доступных."
+                "Если указать меньше текущего числа, лишние роботы будут удалены из базы. "
+                "Сначала удаляются роботы на обслуживании, потом доступные."
             )
         await callback.answer()
         return
@@ -510,7 +520,6 @@ async def cb_robots(callback: CallbackQuery, state: FSMContext) -> None:
     if callback.message:
         await callback.message.edit_text(await robots_panel_text(), reply_markup=robots_keyboard())
 
-
 @router.message(RobotSettings.count)
 async def set_robot_count(message: Message, state: FSMContext) -> None:
     if not message.from_user or not is_admin(message.from_user.id):
@@ -518,7 +527,7 @@ async def set_robot_count(message: Message, state: FSMContext) -> None:
         await state.clear()
         return
     if not message.text or not message.text.strip().isdigit():
-        await message.answer("Введите общее количество роботов целым числом: 0, 1, 2, 3 ...")
+        await message.answer("Введите целое число: 0, 1, 2, 3 ...")
         return
 
     target_count = int(message.text.strip())
@@ -529,11 +538,10 @@ async def set_robot_count(message: Message, state: FSMContext) -> None:
     await db.set_total_robot_count(target_count)
     await state.clear()
     await message.answer(
-        f"✅ Общее количество роботов в базе установлено: {target_count}",
+        f"✅ Общее количество роботов установлено: {target_count}",
         reply_markup=admin_menu(),
     )
     await message.answer(await robots_panel_text(), reply_markup=robots_keyboard())
-
 
 @router.callback_query(F.data == "support:start")
 async def cb_support_start(callback: CallbackQuery, state: FSMContext) -> None:
@@ -552,23 +560,24 @@ async def support_client_message(message: Message, state: FSMContext, bot: Bot) 
     if not message.from_user:
         return
     if is_admin(message.from_user.id):
-        await message.answer("Администратор отвечает клиентам через кнопку под сообщением клиента.", reply_markup=admin_menu())
+        await message.answer(
+            "Администратор отвечает клиентам через кнопку под сообщением клиента.",
+            reply_markup=admin_menu(),
+        )
         await state.clear()
-        return
-    if not message.text or not message.text.strip():
-        await message.answer("Пожалуйста, отправьте вопрос текстом.")
         return
 
     user = message.from_user
     await db.ensure_user(user.id, user.full_name, user.username, admin=False)
     client_label = user.full_name or "Без имени"
     username = f"@{user.username}" if user.username else "username не указан"
+    body = message.text or message.caption or "[клиент отправил вложение без текста]"
     admin_text = (
         "💬 Сообщение от клиента\n\n"
         f"👤 Клиент: {client_label}\n"
         f"🔗 Telegram: {username}\n"
         f"🆔 ID: {user.id}\n\n"
-        f"Текст сообщения:\n{message.text.strip()}"
+        f"Текст сообщения:\n{body.strip()}"
     )
 
     assert settings is not None
@@ -580,9 +589,19 @@ async def support_client_message(message: Message, state: FSMContext, bot: Bot) 
                 admin_text,
                 reply_markup=support_admin_keyboard(user.id),
             )
+            # Если клиент отправил не текст, дополнительно копируем вложение админу.
+            if not message.text:
+                try:
+                    await message.copy_to(admin_id)
+                except Exception:
+                    logger.exception("Не удалось скопировать вложение клиента админу %s", admin_id)
             delivered += 1
         except Exception:
-            pass
+            logger.exception(
+                "Не удалось доставить сообщение поддержки админу %s. "
+                "Проверьте ADMIN_IDS и что админ нажал /start в боте.",
+                admin_id,
+            )
 
     await state.clear()
     if delivered:
@@ -592,10 +611,10 @@ async def support_client_message(message: Message, state: FSMContext, bot: Bot) 
         )
     else:
         await message.answer(
-            "⚠️ Не удалось отправить сообщение администратору. Попробуйте позже или позвоните по контактному номеру.",
+            "⚠️ Не удалось отправить сообщение администратору. "
+            "Проверьте, что администратор уже запускал этого бота через /start.",
             reply_markup=client_menu(),
         )
-
 
 @router.callback_query(F.data.startswith("support:reply:"))
 async def cb_support_reply(callback: CallbackQuery, state: FSMContext) -> None:
@@ -628,9 +647,6 @@ async def support_admin_reply(message: Message, state: FSMContext, bot: Bot) -> 
         await message.answer("Нет доступа.")
         await state.clear()
         return
-    if not message.text or not message.text.strip():
-        await message.answer("Пожалуйста, отправьте ответ текстом.")
-        return
 
     data = await state.get_data()
     client_id = data.get("reply_client_id")
@@ -640,12 +656,17 @@ async def support_admin_reply(message: Message, state: FSMContext, bot: Bot) -> 
         return
 
     try:
-        await bot.send_message(
-            int(client_id),
-            "💬 Ответ администратора:\n\n" + message.text.strip(),
-            reply_markup=support_again_keyboard(),
-        )
+        if message.text:
+            await bot.send_message(
+                int(client_id),
+                "💬 Ответ администратора:\n\n" + message.text.strip(),
+                reply_markup=support_again_keyboard(),
+            )
+        else:
+            await bot.send_message(int(client_id), "💬 Ответ администратора:")
+            await message.copy_to(int(client_id), reply_markup=support_again_keyboard())
     except Exception:
+        logger.exception("Не удалось отправить ответ поддержки клиенту %s", client_id)
         await message.answer(
             "⚠️ Не удалось отправить ответ клиенту. Возможно, клиент заблокировал бота.",
             reply_markup=admin_menu(),
@@ -655,7 +676,6 @@ async def support_admin_reply(message: Message, state: FSMContext, bot: Bot) -> 
 
     await state.clear()
     await message.answer("✅ Ответ отправлен клиенту.", reply_markup=admin_menu())
-
 
 @router.message()
 async def fallback(message: Message) -> None:

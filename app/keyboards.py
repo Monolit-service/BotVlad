@@ -72,8 +72,8 @@ def robots_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="➕ Добавить робота", callback_data="robots:add_total"),
-                InlineKeyboardButton(text="➖ Удалить робота", callback_data="robots:remove_total"),
+                InlineKeyboardButton(text="➕ Добавить робота", callback_data="robots:add"),
+                InlineKeyboardButton(text="➖ Удалить робота", callback_data="robots:remove"),
             ],
             [
                 InlineKeyboardButton(text="🛠️ +1 на обслуживание", callback_data="robots:maintenance_add"),
