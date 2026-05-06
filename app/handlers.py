@@ -75,24 +75,15 @@ async def robots_panel_text() -> str:
 
 
 async def safe_delete_message(bot: Bot, chat_id: int, message_id: int | None) -> None:
-    if not message_id:
-        return
-    try:
-        await bot.delete_message(chat_id, message_id)
-    except Exception:
-        # Сообщение могло быть уже удалено, слишком старым или недоступным.
-        logger.debug("Не удалось удалить сообщение %s в чате %s", message_id, chat_id, exc_info=True)
+    return
 
 
 async def delete_incoming(message: Message, bot: Bot) -> None:
-    await safe_delete_message(bot, message.chat.id, message.message_id)
+    return
 
 
 async def delete_last_ui_message(bot: Bot, chat_id: int, scope: str = "main") -> None:
-    last_message_id = await db.get_ui_message(chat_id, scope=scope)
-    if last_message_id:
-        await safe_delete_message(bot, chat_id, last_message_id)
-        await db.clear_ui_message(chat_id, scope=scope)
+    return
 
 
 async def send_clean_message(
