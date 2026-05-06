@@ -44,10 +44,9 @@ async def build_calendar(year: int, month: int, mode: str = "client") -> tuple[s
     """Build an inline calendar.
 
     mode='client': клиент видит только свободно/занято и не может менять занятость.
-    mode='admin': админ видит остаток роботов и может нажать день для управления.
+    mode='admin': админ видит счётчик подтверждённых броней и может нажать день для управления.
     """
     today = date.today()
-    active_count = await db.active_robot_count()
     cal = py_calendar.Calendar(firstweekday=0)
 
     rows: list[list[InlineKeyboardButton]] = []
@@ -69,13 +68,16 @@ async def build_calendar(year: int, month: int, mode: str = "client") -> tuple[s
                 callback = "noop"
             elif usage.available > 0:
                 if mode == "admin":
-                    text = f"🟢 {cur.day} {usage.available}/{active_count}"
+                    # В админском календаре счетчик показывает общую занятость:
+                    # подтвержденные брони + ручные блокировки / активные роботы.
+                    # Подробная разбивка открывается при нажатии на дату.
+                    text = f"🟢 {cur.day} {usage.occupied_total}/{usage.active_robots}"
                 else:
                     text = f"🟢 {cur.day}"
                 callback = f"day:{mode}:{iso}"
             else:
                 if mode == "admin":
-                    text = f"🔴 {cur.day} 0/{active_count}"
+                    text = f"🔴 {cur.day} {usage.occupied_total}/{usage.active_robots}"
                     callback = f"day:{mode}:{iso}"
                 else:
                     text = f"🔴 {cur.day}"
@@ -98,7 +100,7 @@ async def build_calendar(year: int, month: int, mode: str = "client") -> tuple[s
     legend = (
         "🟢 свободно, 🔴 занято, ⚪ недоступно"
         if mode == "client"
-        else "🟢 свободно N/всего, 🔴 свободных роботов нет, ⚪ прошлые даты"
+        else "🟢 дата доступна, 🔴 мест нет, N/всего = занято всего/активные роботы"
     )
     text = f"📅 {month_title(year, month)}\n{legend}"
     return text, InlineKeyboardMarkup(inline_keyboard=rows)

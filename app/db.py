@@ -68,6 +68,26 @@ CREATE TABLE IF NOT EXISTS manual_blocks (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Простое постоянное состояние чата поддержки.
+-- Оно не теряется при перезапуске контейнера, в отличие от MemoryStorage FSM.
+CREATE TABLE IF NOT EXISTS support_sessions (
+    telegram_id INTEGER PRIMARY KEY,
+    mode TEXT NOT NULL,
+    target_client_id INTEGER,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Последнее сервисное сообщение бота в личном чате.
+-- Нужно, чтобы заменять старые меню/календарь/шаги формы новыми сообщениями
+-- и не оставлять в чате неактуальные кнопки.
+CREATE TABLE IF NOT EXISTS ui_messages (
+    telegram_id INTEGER NOT NULL,
+    scope TEXT NOT NULL DEFAULT 'main',
+    message_id INTEGER NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (telegram_id, scope)
+);
+
 CREATE INDEX IF NOT EXISTS idx_bookings_status ON bookings(status);
 CREATE INDEX IF NOT EXISTS idx_booking_dates_date ON booking_dates(date);
 CREATE INDEX IF NOT EXISTS idx_manual_blocks_date ON manual_blocks(date);
@@ -83,6 +103,11 @@ class DayAvailability:
     available: int
 
     @property
+    def occupied_total(self) -> int:
+        """Confirmed bookings plus manual blocks for this date."""
+        return self.confirmed_bookings + self.manual_blocks
+
+    @property
     def is_free(self) -> bool:
         return self.available > 0
 
@@ -93,6 +118,30 @@ async def init_db(initial_robots: int = 1) -> None:
         await db.executescript(SCHEMA_SQL)
         # Старые версии использовали статус inactive. Теперь это обслуживание.
         await db.execute("UPDATE robots SET status='maintenance' WHERE status='inactive'")
+
+        # Миграция для старых подтверждённых броней: если бронь уже была
+        # подтверждена, но строки в booking_dates по какой-то причине не были
+        # созданы, админский календарь не сможет посчитать занятых роботов.
+        cursor = await db.execute(
+            """
+            SELECT b.id, b.requested_dates_text
+            FROM bookings b
+            WHERE b.status='confirmed'
+              AND NOT EXISTS (SELECT 1 FROM booking_dates bd WHERE bd.booking_id=b.id)
+            """
+        )
+        confirmed_without_dates = await cursor.fetchall()
+        for booking_id, requested_dates_text in confirmed_without_dates:
+            try:
+                iso_dates = parse_dates_to_iso(requested_dates_text or "")
+            except ValueError:
+                continue
+            for iso in iso_dates:
+                await db.execute(
+                    "INSERT OR IGNORE INTO booking_dates(booking_id, date) VALUES (?, ?)",
+                    (booking_id, iso),
+                )
+
         await db.commit()
         cursor = await db.execute("SELECT COUNT(*) FROM robots")
         row = await cursor.fetchone()
@@ -134,6 +183,64 @@ async def ensure_user(telegram_id: int, full_name: str | None, username: str | N
             (telegram_id, full_name, username, role),
         )
 
+
+
+
+async def set_client_waiting_support(telegram_id: int) -> None:
+    async with get_db() as db:
+        await db.execute(
+            """
+            INSERT INTO support_sessions(telegram_id, mode, target_client_id, updated_at)
+            VALUES (?, 'client_waiting', NULL, CURRENT_TIMESTAMP)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+                mode='client_waiting',
+                target_client_id=NULL,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (telegram_id,),
+        )
+
+
+async def is_client_waiting_support(telegram_id: int) -> bool:
+    async with get_db() as db:
+        cursor = await db.execute(
+            "SELECT mode FROM support_sessions WHERE telegram_id=?",
+            (telegram_id,),
+        )
+        row = await cursor.fetchone()
+    return bool(row and row["mode"] == "client_waiting")
+
+
+async def clear_support_session(telegram_id: int) -> None:
+    async with get_db() as db:
+        await db.execute("DELETE FROM support_sessions WHERE telegram_id=?", (telegram_id,))
+
+
+async def set_admin_reply_target(admin_telegram_id: int, client_telegram_id: int) -> None:
+    async with get_db() as db:
+        await db.execute(
+            """
+            INSERT INTO support_sessions(telegram_id, mode, target_client_id, updated_at)
+            VALUES (?, 'admin_reply', ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+                mode='admin_reply',
+                target_client_id=excluded.target_client_id,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (admin_telegram_id, client_telegram_id),
+        )
+
+
+async def get_admin_reply_target(admin_telegram_id: int) -> int | None:
+    async with get_db() as db:
+        cursor = await db.execute(
+            "SELECT target_client_id FROM support_sessions WHERE telegram_id=? AND mode='admin_reply'",
+            (admin_telegram_id,),
+        )
+        row = await cursor.fetchone()
+    if not row or row["target_client_id"] is None:
+        return None
+    return int(row["target_client_id"])
 
 async def active_robot_count() -> int:
     async with get_db() as db:
@@ -436,3 +543,37 @@ async def block_remaining_robots(iso_date: str) -> int:
 
 async def clear_manual_block(iso_date: str) -> None:
     await set_manual_block(iso_date, 0)
+
+
+async def remember_ui_message(telegram_id: int, message_id: int, scope: str = "main") -> None:
+    async with get_db() as db:
+        await db.execute(
+            """
+            INSERT INTO ui_messages(telegram_id, scope, message_id, updated_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(telegram_id, scope) DO UPDATE SET
+                message_id=excluded.message_id,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (telegram_id, scope, message_id),
+        )
+
+
+async def get_ui_message(telegram_id: int, scope: str = "main") -> int | None:
+    async with get_db() as db:
+        cursor = await db.execute(
+            "SELECT message_id FROM ui_messages WHERE telegram_id=? AND scope=?",
+            (telegram_id, scope),
+        )
+        row = await cursor.fetchone()
+    if not row:
+        return None
+    return int(row["message_id"])
+
+
+async def clear_ui_message(telegram_id: int, scope: str = "main") -> None:
+    async with get_db() as db:
+        await db.execute(
+            "DELETE FROM ui_messages WHERE telegram_id=? AND scope=?",
+            (telegram_id, scope),
+        )
