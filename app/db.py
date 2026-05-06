@@ -68,24 +68,12 @@ CREATE TABLE IF NOT EXISTS manual_blocks (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
--- Простое постоянное состояние чата поддержки.
--- Оно не теряется при перезапуске контейнера, в отличие от MemoryStorage FSM.
 CREATE TABLE IF NOT EXISTS support_sessions (
     telegram_id INTEGER PRIMARY KEY,
     mode TEXT NOT NULL,
-    target_client_id INTEGER,
+    peer_telegram_id INTEGER,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
--- Последнее сервисное сообщение бота в личном чате.
--- Нужно, чтобы заменять старые меню/календарь/шаги формы новыми сообщениями
--- и не оставлять в чате неактуальные кнопки.
-CREATE TABLE IF NOT EXISTS ui_messages (
-    telegram_id INTEGER NOT NULL,
-    scope TEXT NOT NULL DEFAULT 'main',
-    message_id INTEGER NOT NULL,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (telegram_id, scope)
 );
 
 CREATE INDEX IF NOT EXISTS idx_bookings_status ON bookings(status);
@@ -103,11 +91,6 @@ class DayAvailability:
     available: int
 
     @property
-    def occupied_total(self) -> int:
-        """Confirmed bookings plus manual blocks for this date."""
-        return self.confirmed_bookings + self.manual_blocks
-
-    @property
     def is_free(self) -> bool:
         return self.available > 0
 
@@ -116,32 +99,10 @@ async def init_db(initial_robots: int = 1) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(SCHEMA_SQL)
-        # Старые версии использовали статус inactive. Теперь это обслуживание.
+        # Миграция со старых версий: раньше уменьшение парка переводило робота
+        # в статус inactive. Теперь отдельного inactive нет: робот либо активен,
+        # либо находится на обслуживании, либо удаляется из базы.
         await db.execute("UPDATE robots SET status='maintenance' WHERE status='inactive'")
-
-        # Миграция для старых подтверждённых броней: если бронь уже была
-        # подтверждена, но строки в booking_dates по какой-то причине не были
-        # созданы, админский календарь не сможет посчитать занятых роботов.
-        cursor = await db.execute(
-            """
-            SELECT b.id, b.requested_dates_text
-            FROM bookings b
-            WHERE b.status='confirmed'
-              AND NOT EXISTS (SELECT 1 FROM booking_dates bd WHERE bd.booking_id=b.id)
-            """
-        )
-        confirmed_without_dates = await cursor.fetchall()
-        for booking_id, requested_dates_text in confirmed_without_dates:
-            try:
-                iso_dates = parse_dates_to_iso(requested_dates_text or "")
-            except ValueError:
-                continue
-            for iso in iso_dates:
-                await db.execute(
-                    "INSERT OR IGNORE INTO booking_dates(booking_id, date) VALUES (?, ?)",
-                    (booking_id, iso),
-                )
-
         await db.commit()
         cursor = await db.execute("SELECT COUNT(*) FROM robots")
         row = await cursor.fetchone()
@@ -184,64 +145,6 @@ async def ensure_user(telegram_id: int, full_name: str | None, username: str | N
         )
 
 
-
-
-async def set_client_waiting_support(telegram_id: int) -> None:
-    async with get_db() as db:
-        await db.execute(
-            """
-            INSERT INTO support_sessions(telegram_id, mode, target_client_id, updated_at)
-            VALUES (?, 'client_waiting', NULL, CURRENT_TIMESTAMP)
-            ON CONFLICT(telegram_id) DO UPDATE SET
-                mode='client_waiting',
-                target_client_id=NULL,
-                updated_at=CURRENT_TIMESTAMP
-            """,
-            (telegram_id,),
-        )
-
-
-async def is_client_waiting_support(telegram_id: int) -> bool:
-    async with get_db() as db:
-        cursor = await db.execute(
-            "SELECT mode FROM support_sessions WHERE telegram_id=?",
-            (telegram_id,),
-        )
-        row = await cursor.fetchone()
-    return bool(row and row["mode"] == "client_waiting")
-
-
-async def clear_support_session(telegram_id: int) -> None:
-    async with get_db() as db:
-        await db.execute("DELETE FROM support_sessions WHERE telegram_id=?", (telegram_id,))
-
-
-async def set_admin_reply_target(admin_telegram_id: int, client_telegram_id: int) -> None:
-    async with get_db() as db:
-        await db.execute(
-            """
-            INSERT INTO support_sessions(telegram_id, mode, target_client_id, updated_at)
-            VALUES (?, 'admin_reply', ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(telegram_id) DO UPDATE SET
-                mode='admin_reply',
-                target_client_id=excluded.target_client_id,
-                updated_at=CURRENT_TIMESTAMP
-            """,
-            (admin_telegram_id, client_telegram_id),
-        )
-
-
-async def get_admin_reply_target(admin_telegram_id: int) -> int | None:
-    async with get_db() as db:
-        cursor = await db.execute(
-            "SELECT target_client_id FROM support_sessions WHERE telegram_id=? AND mode='admin_reply'",
-            (admin_telegram_id,),
-        )
-        row = await cursor.fetchone()
-    if not row or row["target_client_id"] is None:
-        return None
-    return int(row["target_client_id"])
-
 async def active_robot_count() -> int:
     async with get_db() as db:
         cursor = await db.execute("SELECT COUNT(*) FROM robots WHERE status='active'")
@@ -251,21 +154,28 @@ async def active_robot_count() -> int:
 
 async def robot_summary() -> dict[str, int]:
     async with get_db() as db:
+        # На всякий случай нормализуем старые записи из предыдущих версий.
+        await db.execute("UPDATE robots SET status='maintenance' WHERE status='inactive'")
         cursor = await db.execute("SELECT status, COUNT(*) AS cnt FROM robots GROUP BY status")
         rows = await cursor.fetchall()
-    summary = {"active": 0, "maintenance": 0, "inactive": 0, "total": 0}
+
+    summary = {"active": 0, "maintenance": 0, "total": 0}
     for row in rows:
         status = row["status"]
         count = int(row["cnt"])
-        if status == "inactive":
-            status = "maintenance"
-        summary[status] = summary.get(status, 0) + count
+        if status == "active":
+            summary["active"] += count
+        elif status == "maintenance":
+            summary["maintenance"] += count
+        else:
+            # Неизвестные старые статусы не участвуют в доступности, но видны в общем числе.
+            summary["maintenance"] += count
         summary["total"] += count
     return summary
 
 
-async def add_robot() -> int:
-    """Add one new robot to the total fleet and make it available."""
+async def add_robot_to_fleet() -> int:
+    """Create one new robot in the database and make it available for bookings."""
     async with get_db() as db:
         cursor = await db.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM robots")
         next_num = int((await cursor.fetchone())[0])
@@ -276,18 +186,17 @@ async def add_robot() -> int:
         return int(cursor.lastrowid)
 
 
-async def remove_one_robot() -> bool:
-    """Remove one robot from the total fleet.
+async def remove_one_robot_from_fleet() -> bool:
+    """Delete one robot from the database.
 
-    Prefer deleting a robot that is on maintenance so active availability is not
-    reduced unexpectedly. If there are no maintenance robots, remove the last
-    active robot.
+    Maintenance robots are removed first so availability is not reduced when possible.
+    If there are no maintenance robots, the last active robot is deleted.
     """
     async with get_db() as db:
         cursor = await db.execute(
             """
             SELECT id FROM robots
-            ORDER BY CASE WHEN status='maintenance' THEN 0 WHEN status='inactive' THEN 1 ELSE 2 END, id DESC
+            ORDER BY CASE WHEN status='maintenance' THEN 0 ELSE 1 END, id DESC
             LIMIT 1
             """
         )
@@ -299,33 +208,36 @@ async def remove_one_robot() -> bool:
 
 
 async def set_total_robot_count(target_count: int) -> dict[str, int]:
-    """Set exact total number of robots stored in the database.
+    """Set the exact total number of robots in the database.
 
-    Increasing the value creates new active robots. Decreasing the value deletes
-    robots, preferring maintenance robots first, then active robots.
+    Increasing the count creates new active robots. Decreasing the count deletes
+    maintenance robots first, then active robots. Existing booking records stay
+    intact; date availability is recalculated from the remaining active robots.
     """
     target_count = max(0, int(target_count))
     async with get_db() as db:
+        await db.execute("UPDATE robots SET status='maintenance' WHERE status='inactive'")
         cursor = await db.execute("SELECT COUNT(*) FROM robots")
-        total_count = int((await cursor.fetchone())[0])
+        current_total = int((await cursor.fetchone())[0])
 
-        if target_count > total_count:
-            for _ in range(target_count - total_count):
+        if target_count > current_total:
+            for _ in range(target_count - current_total):
                 cursor = await db.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM robots")
                 next_num = int((await cursor.fetchone())[0])
                 await db.execute(
                     "INSERT INTO robots(name, status) VALUES (?, 'active')",
                     (f"Робот #{next_num}",),
                 )
-        elif target_count < total_count:
-            delete_count = total_count - target_count
+
+        elif target_count < current_total:
+            remove_count = current_total - target_count
             cursor = await db.execute(
                 """
                 SELECT id FROM robots
-                ORDER BY CASE WHEN status='maintenance' THEN 0 WHEN status='inactive' THEN 1 ELSE 2 END, id DESC
+                ORDER BY CASE WHEN status='maintenance' THEN 0 ELSE 1 END, id DESC
                 LIMIT ?
                 """,
-                (delete_count,),
+                (remove_count,),
             )
             rows = await cursor.fetchall()
             for row in rows:
@@ -334,9 +246,12 @@ async def set_total_robot_count(target_count: int) -> dict[str, int]:
     return await robot_summary()
 
 
-async def send_one_robot_to_maintenance() -> bool:
+async def move_one_robot_to_maintenance() -> bool:
+    """Mark one active robot as being on maintenance."""
     async with get_db() as db:
-        cursor = await db.execute("SELECT id FROM robots WHERE status='active' ORDER BY id DESC LIMIT 1")
+        cursor = await db.execute(
+            "SELECT id FROM robots WHERE status='active' ORDER BY id DESC LIMIT 1"
+        )
         row = await cursor.fetchone()
         if not row:
             return False
@@ -345,8 +260,11 @@ async def send_one_robot_to_maintenance() -> bool:
 
 
 async def return_one_robot_from_maintenance() -> bool:
+    """Return one maintenance robot back to active availability."""
     async with get_db() as db:
-        cursor = await db.execute("SELECT id FROM robots WHERE status IN ('maintenance', 'inactive') ORDER BY id LIMIT 1")
+        cursor = await db.execute(
+            "SELECT id FROM robots WHERE status='maintenance' ORDER BY id LIMIT 1"
+        )
         row = await cursor.fetchone()
         if not row:
             return False
@@ -354,13 +272,17 @@ async def return_one_robot_from_maintenance() -> bool:
         return True
 
 
-# Backward-compatible aliases for old handlers or external scripts.
+# Backward-compatible aliases for older code/tests.
 async def set_active_robot_count(target_count: int) -> dict[str, int]:
     return await set_total_robot_count(target_count)
 
 
+async def add_robot() -> int:
+    return await add_robot_to_fleet()
+
+
 async def remove_one_active_robot() -> bool:
-    return await remove_one_robot()
+    return await remove_one_robot_from_fleet()
 
 
 async def create_booking(
@@ -545,35 +467,35 @@ async def clear_manual_block(iso_date: str) -> None:
     await set_manual_block(iso_date, 0)
 
 
-async def remember_ui_message(telegram_id: int, message_id: int, scope: str = "main") -> None:
+async def set_support_session(telegram_id: int, mode: str, peer_telegram_id: int | None = None) -> None:
+    """Save a durable support-chat step.
+
+    mode='client_waiting' means the next client message should be forwarded to admins.
+    mode='admin_reply' means the next admin message should be sent to peer_telegram_id.
+    """
     async with get_db() as db:
         await db.execute(
             """
-            INSERT INTO ui_messages(telegram_id, scope, message_id, updated_at)
-            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(telegram_id, scope) DO UPDATE SET
-                message_id=excluded.message_id,
+            INSERT INTO support_sessions(telegram_id, mode, peer_telegram_id)
+            VALUES (?, ?, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+                mode=excluded.mode,
+                peer_telegram_id=excluded.peer_telegram_id,
                 updated_at=CURRENT_TIMESTAMP
             """,
-            (telegram_id, scope, message_id),
+            (telegram_id, mode, peer_telegram_id),
         )
 
 
-async def get_ui_message(telegram_id: int, scope: str = "main") -> int | None:
+async def get_support_session(telegram_id: int) -> aiosqlite.Row | None:
     async with get_db() as db:
         cursor = await db.execute(
-            "SELECT message_id FROM ui_messages WHERE telegram_id=? AND scope=?",
-            (telegram_id, scope),
+            "SELECT * FROM support_sessions WHERE telegram_id=?",
+            (telegram_id,),
         )
-        row = await cursor.fetchone()
-    if not row:
-        return None
-    return int(row["message_id"])
+        return await cursor.fetchone()
 
 
-async def clear_ui_message(telegram_id: int, scope: str = "main") -> None:
+async def clear_support_session(telegram_id: int) -> None:
     async with get_db() as db:
-        await db.execute(
-            "DELETE FROM ui_messages WHERE telegram_id=? AND scope=?",
-            (telegram_id, scope),
-        )
+        await db.execute("DELETE FROM support_sessions WHERE telegram_id=?", (telegram_id,))
